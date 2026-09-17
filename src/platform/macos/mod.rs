@@ -209,10 +209,8 @@ impl OsIpcReceiver {
     ///
     /// Not resolved on the Mach-port back-end: a Mach message does not carry the
     /// sender's pid unless a receive-time audit trailer is requested, which this
-    /// transport does not do. Peer attestation on macOS instead relies on the
-    /// per-launch bootstrap-namespace isolation of the one-shot server: an
-    /// unrelated process cannot resolve the endpoint name (`bootstrap_look_up`
-    /// returns `BOOTSTRAP_UNKNOWN_SERVICE`). Always returns `None`.
+    /// transport does not do. Always returns `None`; a caller that needs peer
+    /// authentication on macOS must establish it by other means.
     pub fn peer_pid(&self) -> Option<u32> {
         None
     }
