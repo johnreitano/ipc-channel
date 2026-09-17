@@ -158,25 +158,23 @@ impl OsIpcReceiver {
     /// obtained or on unix targets without `SO_PEERCRED`.
     #[cfg(target_os = "linux")]
     pub fn peer_pid(&self) -> Option<u32> {
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        use std::os::fd::BorrowedFd;
+
         let fd = self.fd.get();
         if fd < 0 {
             return None;
         }
-        let mut cred: libc::ucred = unsafe { mem::zeroed() };
-        let mut len = mem::size_of::<libc::ucred>() as socklen_t;
-        let ret = unsafe {
-            getsockopt(
-                fd,
-                SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut libc::ucred as *mut c_void,
-                &mut len as *mut socklen_t,
-            )
-        };
-        if ret != 0 || cred.pid <= 0 {
+        // SAFETY: `fd` is a socket owned by this receiver. It is only closed by
+        // `Drop` or handed off by `consume_fd`, neither of which can run while
+        // `&self` is borrowed here (`OsIpcReceiver` is not `Sync`), so the fd
+        // stays open for the lifetime of the `BorrowedFd`.
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let pid = getsockopt(&fd, PeerCredentials).ok()?.pid();
+        if pid <= 0 {
             return None;
         }
-        Some(cred.pid as u32)
+        Some(pid as u32)
     }
 
     #[cfg(not(target_os = "linux"))]

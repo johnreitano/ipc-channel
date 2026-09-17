@@ -1165,9 +1165,16 @@ impl OsIpcReceiver {
     /// resolves for the connected client and the client cannot forge. Returns
     /// `None` when the id cannot be obtained.
     pub fn peer_pid(&self) -> Option<u32> {
-        let handle = self.reader.borrow().handle.as_raw();
+        let reader = self.reader.borrow();
         let mut client_pid = 0u32;
-        let ok = unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid).is_ok() };
+        // SAFETY: `reader.handle` is a pipe handle owned by this receiver, and the
+        // `Ref` guard keeps it from being moved or closed for the duration of the
+        // call. `client_pid` is a valid, writable `u32` that outlives the call and
+        // is the only memory the API writes to. If the handle happens to be
+        // invalid (e.g. an async read is in flight), the call fails and we return
+        // `None` rather than invoking undefined behaviour.
+        let ok =
+            unsafe { GetNamedPipeClientProcessId(reader.handle.as_raw(), &mut client_pid).is_ok() };
         if ok && client_pid != 0 {
             Some(client_pid)
         } else {

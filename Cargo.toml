@@ -52,6 +52,9 @@ mio = { version = "1.0", default-features = false, features = ["os-ext"] }
 rustc-hash = "2.1"
 tempfile = "3.4"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", features = ["socket"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 rand = "0.8.5"
 
