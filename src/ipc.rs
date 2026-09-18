@@ -238,6 +238,72 @@ where
         self.os_receiver.peer_pid()
     }
 
+    /// Export this receiver's underlying fd without closing it, for handing one
+    /// channel end to a child process as an inherited fd (fenced-endpoint
+    /// bootstrap). Ownership of the fd is transferred to the caller.
+    #[cfg(all(
+        not(feature = "force-inprocess"),
+        any(
+            target_os = "linux",
+            target_os = "openbsd",
+            target_os = "freebsd",
+            target_os = "illumos",
+        )
+    ))]
+    pub fn into_raw_fd(self) -> std::os::unix::io::RawFd {
+        self.os_receiver.into_raw_fd()
+    }
+
+    /// Reconstruct a typed receiver from a raw fd.
+    ///
+    /// # Safety
+    /// `fd` must be an endpoint fd previously produced by [`IpcReceiver::into_raw_fd`]
+    /// (or the equivalent OS export), carrying messages of type `T`.
+    #[cfg(all(
+        not(feature = "force-inprocess"),
+        any(
+            target_os = "linux",
+            target_os = "openbsd",
+            target_os = "freebsd",
+            target_os = "illumos",
+        )
+    ))]
+    pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
+        IpcReceiver {
+            os_receiver: OsIpcReceiver::from_raw_fd(fd),
+            phantom: PhantomData,
+        }
+    }
+
+    /// Export this receiver's underlying pipe handle without closing it.
+    /// Ownership of the handle is transferred to the caller.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub fn into_raw_handle(self) -> std::os::windows::io::RawHandle {
+        self.os_receiver.into_raw_handle()
+    }
+
+    /// Duplicate this receiver's pipe handle as an inheritable handle, leaving
+    /// the receiver intact. The returned handle is owned by the caller.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub fn inheritable_raw_handle(&self) -> io::Result<std::os::windows::io::RawHandle> {
+        self.os_receiver
+            .inheritable_raw_handle()
+            .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+    }
+
+    /// Reconstruct a typed receiver from a raw pipe handle.
+    ///
+    /// # Safety
+    /// `handle` must be an endpoint handle previously produced by
+    /// [`IpcReceiver::into_raw_handle`], carrying messages of type `T`.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub unsafe fn from_raw_handle(handle: std::os::windows::io::RawHandle) -> Self {
+        IpcReceiver {
+            os_receiver: OsIpcReceiver::from_raw_handle(handle),
+            phantom: PhantomData,
+        }
+    }
+
     /// Erase the type of the channel.
     ///
     /// Useful for adding routes to a `RouterProxy`.
@@ -349,6 +415,80 @@ where
     pub fn to_opaque(self) -> OpaqueIpcSender {
         OpaqueIpcSender {
             os_sender: self.os_sender,
+        }
+    }
+
+    /// Export this sender's underlying fd without closing it, for handing one
+    /// channel end to a child process as an inherited fd (fenced-endpoint
+    /// bootstrap).
+    ///
+    /// Only succeeds when this sender uniquely owns the fd (no outstanding
+    /// clones); otherwise the sender is returned unchanged via `Err`.
+    #[cfg(all(
+        not(feature = "force-inprocess"),
+        any(
+            target_os = "linux",
+            target_os = "openbsd",
+            target_os = "freebsd",
+            target_os = "illumos",
+        )
+    ))]
+    pub fn into_raw_fd(self) -> Result<std::os::unix::io::RawFd, Self> {
+        match self.os_sender.into_raw_fd() {
+            Ok(fd) => Ok(fd),
+            Err(os_sender) => Err(IpcSender {
+                os_sender,
+                phantom: PhantomData,
+            }),
+        }
+    }
+
+    /// Reconstruct a typed sender from a raw fd.
+    ///
+    /// # Safety
+    /// `fd` must be an endpoint fd previously produced by [`IpcSender::into_raw_fd`]
+    /// (or the equivalent OS export), carrying messages of type `T`.
+    #[cfg(all(
+        not(feature = "force-inprocess"),
+        any(
+            target_os = "linux",
+            target_os = "openbsd",
+            target_os = "freebsd",
+            target_os = "illumos",
+        )
+    ))]
+    pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> Self {
+        IpcSender {
+            os_sender: OsIpcSender::from_raw_fd(fd),
+            phantom: PhantomData,
+        }
+    }
+
+    /// Export this sender's underlying pipe handle without closing it.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub fn into_raw_handle(self) -> std::os::windows::io::RawHandle {
+        self.os_sender.into_raw_handle()
+    }
+
+    /// Duplicate this sender's pipe handle as an inheritable handle, leaving the
+    /// sender intact. The returned handle is owned by the caller.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub fn inheritable_raw_handle(&self) -> io::Result<std::os::windows::io::RawHandle> {
+        self.os_sender
+            .inheritable_raw_handle()
+            .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+    }
+
+    /// Reconstruct a typed sender from a raw pipe handle.
+    ///
+    /// # Safety
+    /// `handle` must be an endpoint handle previously produced by
+    /// [`IpcSender::into_raw_handle`], carrying messages of type `T`.
+    #[cfg(all(not(feature = "force-inprocess"), target_os = "windows"))]
+    pub unsafe fn from_raw_handle(handle: std::os::windows::io::RawHandle) -> Self {
+        IpcSender {
+            os_sender: OsIpcSender::from_raw_handle(handle),
+            phantom: PhantomData,
         }
     }
 }

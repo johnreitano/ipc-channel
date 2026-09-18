@@ -47,6 +47,36 @@ fn simple() {
     assert_eq!(ipc_message.data, data);
 }
 
+// Round-trips both endpoints through into_raw_fd/from_raw_fd (the fenced-endpoint
+// bootstrap primitives) and checks the exported fds are not closed and still
+// carry a message. Also checks that clearing FD_CLOEXEC succeeds on the fd.
+#[cfg(all(
+    not(feature = "force-inprocess"),
+    any(
+        target_os = "linux",
+        target_os = "openbsd",
+        target_os = "freebsd",
+        target_os = "illumos",
+    )
+))]
+#[test]
+fn raw_fd_round_trip() {
+    let (tx, rx) = platform::channel().unwrap();
+    let tx_fd = tx.into_raw_fd().expect("sender should be uniquely owned");
+    let rx_fd = rx.into_raw_fd();
+
+    platform::set_fd_inheritable(tx_fd).unwrap();
+    platform::set_fd_inheritable(rx_fd).unwrap();
+
+    let tx = unsafe { OsIpcSender::from_raw_fd(tx_fd) };
+    let rx = unsafe { platform::OsIpcReceiver::from_raw_fd(rx_fd) };
+
+    let data: &[u8] = b"fenced";
+    tx.send(data, Vec::new(), Vec::new()).unwrap();
+    let ipc_message = rx.recv().unwrap();
+    assert_eq!(ipc_message.data, data);
+}
+
 #[test]
 fn sender_transfer() {
     let (super_tx, super_rx) = platform::channel().unwrap();

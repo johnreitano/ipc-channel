@@ -260,6 +260,28 @@ impl OsIpcReceiver {
         OsIpcReceiver::from_name(self.consume_port())
     }
 
+    // TODO(macos): a mach receive right is not inherited across posix_spawn the
+    // way a unix fd or windows handle is, so a raw-port export cannot by itself
+    // implement the fenced-endpoint bootstrap on macOS -- the right still has to
+    // be moved to the child through a mach message or the bootstrap namespace.
+    // The accessors below are exposed for parity/testing only; the fenced-endpoint
+    // approach on macOS continues to rely on the per-launch bootstrap namespace
+    // isolation already used by the one-shot server.
+
+    /// Export the underlying mach receive right without releasing it.
+    pub fn into_raw_port(self) -> mach_port_t {
+        self.consume_port()
+    }
+
+    /// Reconstruct a receiver from a raw mach receive right.
+    ///
+    /// # Safety
+    /// `port` must be a valid mach receive right created by this crate's
+    /// `channel()`, and ownership of it is transferred to the returned receiver.
+    pub unsafe fn from_raw_port(port: mach_port_t) -> OsIpcReceiver {
+        OsIpcReceiver::from_name(port)
+    }
+
     fn sender(&self) -> Result<OsIpcSender, MachError> {
         let port = self.port.get();
         debug_assert!(port != MACH_PORT_NULL);
@@ -451,6 +473,24 @@ impl Clone for OsIpcSender {
 impl OsIpcSender {
     fn from_name(port: mach_port_t) -> OsIpcSender {
         OsIpcSender { port }
+    }
+
+    /// Export the underlying mach send right without releasing it.
+    ///
+    /// See the note on [`OsIpcReceiver::into_raw_port`] about macOS limitations.
+    pub fn into_raw_port(self) -> mach_port_t {
+        let port = self.port;
+        mem::forget(self);
+        port
+    }
+
+    /// Reconstruct a sender from a raw mach send right.
+    ///
+    /// # Safety
+    /// `port` must be a valid mach send right created by this crate's
+    /// `channel()`, and ownership of it is transferred to the returned sender.
+    pub unsafe fn from_raw_port(port: mach_port_t) -> OsIpcSender {
+        OsIpcSender::from_name(port)
     }
 
     pub fn connect(name: String) -> Result<OsIpcSender, MachError> {

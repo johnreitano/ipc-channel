@@ -21,6 +21,7 @@ use std::{
     marker::{Send, Sync},
     mem,
     ops::{Deref, DerefMut, RangeFrom},
+    os::windows::io::RawHandle,
     ptr, slice,
     sync::LazyLock,
     thread,
@@ -393,6 +394,30 @@ fn dup_handle_to_process_with_flags(
             0,
             false,
             flags,
+        )
+        .map(|()| WinHandle::new(new_handle))
+    }
+}
+
+/// Duplicate a handle in the current process, marking the copy inheritable.
+///
+/// Used by the fenced-endpoint bootstrap to obtain a handle that a child
+/// process spawned with `bInheritHandles = TRUE` will inherit.
+fn dup_handle_inheritable(handle: &WinHandle) -> Result<WinHandle, WinError> {
+    if !handle.is_valid() {
+        return Ok(WinHandle::invalid());
+    }
+
+    unsafe {
+        let mut new_handle: HANDLE = INVALID_HANDLE_VALUE;
+        DuplicateHandle(
+            CURRENT_PROCESS_HANDLE.as_raw(),
+            handle.as_raw(),
+            CURRENT_PROCESS_HANDLE.as_raw(),
+            &mut new_handle,
+            0,
+            true,
+            DUPLICATE_SAME_ACCESS,
         )
         .map(|()| WinHandle::new(new_handle))
     }
@@ -1200,6 +1225,35 @@ impl OsIpcReceiver {
         OsIpcReceiver::from_handle(reader.handle.take())
     }
 
+    /// Export the underlying pipe handle without closing it.
+    ///
+    /// Ownership of the handle is transferred to the caller. Any buffered
+    /// receiver state is discarded, so this is only valid on a fresh endpoint
+    /// that has not yet been read from.
+    pub fn into_raw_handle(self) -> RawHandle {
+        let raw = self.reader.borrow_mut().handle.take_raw();
+        raw.0 as RawHandle
+    }
+
+    /// Reconstruct a receiver from a raw pipe handle.
+    ///
+    /// # Safety
+    /// `handle` must be a valid pipe handle created by this crate's `channel()`,
+    /// and ownership of it is transferred to the returned receiver.
+    pub unsafe fn from_raw_handle(handle: RawHandle) -> OsIpcReceiver {
+        OsIpcReceiver::from_handle(WinHandle::new(HANDLE(handle as _)))
+    }
+
+    /// Duplicate the pipe handle as an inheritable handle, leaving this
+    /// receiver's own handle intact. The returned raw handle is owned by the
+    /// caller and must be closed (or consumed by a spawned child).
+    pub fn inheritable_raw_handle(&self) -> Result<RawHandle, WinError> {
+        let dup = dup_handle_inheritable(&self.reader.borrow().handle)?;
+        let raw = dup.as_raw();
+        mem::forget(dup);
+        Ok(raw.0 as RawHandle)
+    }
+
     // This is only used for recv/try_recv/try_recv_timeout.  When this is added to an IpcReceiverSet, then
     // the implementation in select() is used.  It does much the same thing, but across multiple
     // channels.
@@ -1336,6 +1390,34 @@ impl OsIpcSender {
 
     fn from_handle(handle: WinHandle) -> OsIpcSender {
         OsIpcSender { handle }
+    }
+
+    /// Export the underlying pipe handle without closing it.
+    ///
+    /// Ownership of the handle is transferred to the caller.
+    pub fn into_raw_handle(self) -> RawHandle {
+        let mut this = self;
+        let raw = this.handle.take_raw();
+        raw.0 as RawHandle
+    }
+
+    /// Reconstruct a sender from a raw pipe handle.
+    ///
+    /// # Safety
+    /// `handle` must be a valid pipe handle created by this crate's `channel()`,
+    /// and ownership of it is transferred to the returned sender.
+    pub unsafe fn from_raw_handle(handle: RawHandle) -> OsIpcSender {
+        OsIpcSender::from_handle(WinHandle::new(HANDLE(handle as _)))
+    }
+
+    /// Duplicate the pipe handle as an inheritable handle, leaving this
+    /// sender's own handle intact. The returned raw handle is owned by the
+    /// caller and must be closed (or consumed by a spawned child).
+    pub fn inheritable_raw_handle(&self) -> Result<RawHandle, WinError> {
+        let dup = dup_handle_inheritable(&self.handle)?;
+        let raw = dup.as_raw();
+        mem::forget(dup);
+        Ok(raw.0 as RawHandle)
     }
 
     /// Connect to a pipe server.
