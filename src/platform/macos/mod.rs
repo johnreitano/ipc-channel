@@ -205,6 +205,16 @@ fn mach_port_extract_right(
 }
 
 impl OsIpcReceiver {
+    /// OS process id of the peer on the other end of this receiver's channel.
+    ///
+    /// Not resolved on the Mach-port back-end: a Mach message does not carry the
+    /// sender's pid unless a receive-time audit trailer is requested, which this
+    /// transport does not do. Always returns `None`; a caller that needs peer
+    /// authentication on macOS must establish it by other means.
+    pub fn peer_pid(&self) -> Option<u32> {
+        None
+    }
+
     fn new() -> Result<OsIpcReceiver, MachError> {
         let port = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE)?;
         let limits = mach_port_limits_t {
