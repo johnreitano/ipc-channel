@@ -358,6 +358,34 @@ fn cross_process_embedded_senders_spawn() {
     target_os = "ios"
 )))]
 #[test]
+fn one_shot_server_reports_connecting_peer_pid() {
+    let (server, server_name) = IpcOneShotServer::<u32>::new().unwrap();
+    let child_pid = unsafe {
+        fork(|| {
+            let tx: IpcSender<u32> = IpcSender::connect(server_name).unwrap();
+            tx.send(42).unwrap();
+        })
+    };
+    let (rx, received) = server.accept().unwrap();
+    child_pid.wait();
+    assert_eq!(received, 42);
+    assert_eq!(rx.peer_pid(), Some(child_pid as u32));
+}
+
+#[cfg(all(target_os = "macos", not(feature = "force-inprocess")))]
+#[test]
+fn channel_receiver_has_no_peer_pid() {
+    let (_tx, rx): (IpcSender<u32>, IpcReceiver<u32>) = ipc::channel().unwrap();
+    assert_eq!(rx.peer_pid(), None);
+}
+
+#[cfg(not(any(
+    feature = "force-inprocess",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
+#[test]
 fn cross_process_embedded_senders_fork() {
     let person = ("Patrick Walton".to_owned(), 29);
     let (server0, server0_name) = IpcOneShotServer::new().unwrap();
