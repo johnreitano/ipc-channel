@@ -36,7 +36,7 @@ mod mach_sys;
 const SMALL_MESSAGE_SIZE: usize = 4096;
 
 // Receive-trailer options from <mach/message.h>; see
-// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/message.h
+// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/mach/message.h
 // `MACH_RCV_TRAILER_TYPE` and `MACH_RCV_TRAILER_ELEMENTS` are function-like
 // macros there, so they are mirrored as `const fn`s.
 const MACH_MSG_TRAILER_FORMAT_0: i32 = 0;
@@ -52,11 +52,12 @@ const fn mach_rcv_trailer_elements(elements: i32) -> i32 {
 
 /// Receive option asking the kernel to append a `mach_msg_audit_trailer_t`,
 /// which identifies the sending task, to a received message.
-const MACH_RCV_AUDIT_TRAILER: i32 = mach_rcv_trailer_type(MACH_MSG_TRAILER_FORMAT_0)
+const AUDIT_TRAILER_RCV_OPTION: i32 = mach_rcv_trailer_type(MACH_MSG_TRAILER_FORMAT_0)
     | mach_rcv_trailer_elements(MACH_RCV_TRAILER_AUDIT);
 
-/// `round_msg()` from <mach/message.h>: message sizes are rounded up to a
-/// multiple of 4 bytes, which is where the kernel places the trailer.
+/// `round_msg()` from <mach/message.h>: the kernel places the receive trailer
+/// at the message size rounded up to a multiple of `sizeof(natural_t)` (4
+/// bytes).
 fn round_msg(size: usize) -> usize {
     (size + 3) & !3
 }
@@ -755,7 +756,8 @@ fn select(
 }
 
 /// Like `select`, and when `audit_sender` is set also returns the pid of the
-/// process that sent the message, taken from the kernel's audit trailer.
+/// process that sent the message, taken from the kernel's audit trailer. The
+/// pid is `None` for a no-senders notification, which comes from the kernel.
 fn select_with_sender(
     port: mach_port_t,
     blocking_mode: BlockingMode,
@@ -777,7 +779,7 @@ fn select_with_sender(
                 .unwrap_or((MACH_RCV_MSG | MACH_RCV_LARGE, MACH_MSG_TIMEOUT_NONE)),
         };
         let flags = if audit_sender {
-            flags | MACH_RCV_AUDIT_TRAILER
+            flags | AUDIT_TRAILER_RCV_OPTION
         } else {
             flags
         };
@@ -831,19 +833,17 @@ fn select_with_sender(
             os_result => return Err(MachError::from(os_result)),
         }
 
+        let local_port = (*message).header.msgh_local_port;
+        if (*message).header.msgh_id == MACH_NOTIFY_NO_SENDERS {
+            // A kernel notification, not a message from a peer.
+            return Ok((OsIpcSelectionResult::ChannelClosed(local_port as u64), None));
+        }
+
         let sender_pid = if audit_sender {
             audit_trailer_pid(message)
         } else {
             None
         };
-
-        let local_port = (*message).header.msgh_local_port;
-        if (*message).header.msgh_id == MACH_NOTIFY_NO_SENDERS {
-            return Ok((
-                OsIpcSelectionResult::ChannelClosed(local_port as u64),
-                sender_pid,
-            ));
-        }
 
         let (mut ports, mut shared_memory_regions) = (Vec::new(), Vec::new());
         let mut port_descriptor = message.offset(1) as *mut mach_msg_port_descriptor_t;
@@ -902,7 +902,8 @@ fn select_with_sender(
 }
 
 /// Reads the sender's pid from the audit trailer the kernel appended to a
-/// message received with `MACH_RCV_AUDIT_TRAILER`.
+/// message received with `AUDIT_TRAILER_RCV_OPTION`. Returns `None` if the
+/// kernel supplied a shorter trailer or the pid does not fit a `u32`.
 ///
 /// # Safety
 ///

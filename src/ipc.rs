@@ -227,13 +227,14 @@ where
     }
 
     /// Returns the OS process id of the peer connected to the other end of this
-    /// receiver's channel, when the platform can attest it.
+    /// receiver's channel, when the platform can attest it: `SO_PEERCRED` on
+    /// Linux and `GetNamedPipeClientProcessId` on Windows.
     ///
-    /// This is intended for authenticating the connecting peer of an
-    /// [IpcOneShotServer] before trusting it: the accepted receiver's peer pid
-    /// can be matched against the pid of the process the server expected to
-    /// connect. Returns `None` on platforms that cannot resolve a peer pid for
-    /// the underlying transport.
+    /// Always `None` on macOS, where a receiver is a Mach receive right that
+    /// may have any number of senders, and on other targets that cannot resolve
+    /// a peer pid for the underlying transport. To authenticate the connecting
+    /// peer of an [IpcOneShotServer] on every platform, use
+    /// [IpcOneShotServer::accept_with_peer_pid] instead.
     pub fn peer_pid(&self) -> Option<u32> {
         self.os_receiver.peer_pid()
     }
@@ -928,11 +929,12 @@ where
         ))
     }
 
-    /// Like `accept`, and also returns the OS process id of the peer that
-    /// connected and sent the first message, when the platform can report it:
-    /// from `SO_PEERCRED` on Linux, `GetNamedPipeClientProcessId` on Windows,
-    /// and the Mach audit trailer of the accepted message on macOS. `None`
-    /// where it is unavailable.
+    /// Like `accept`, and also returns the peer's OS process id when the
+    /// platform can attest it: the process that opened the connection on Linux
+    /// (`SO_PEERCRED`) and Windows (`GetNamedPipeClientProcessId`), and the
+    /// process that sent the accepted message on macOS (Mach audit trailer).
+    /// `None` on other targets (including Android, the BSDs and illumos), with
+    /// the `force-inprocess` feature, or when the id cannot be obtained.
     pub fn accept_with_peer_pid(self) -> Result<(IpcReceiver<T>, T, Option<u32>), IpcError> {
         let (os_receiver, ipc_message, peer_pid) = self.os_server.accept_with_peer_pid()?;
         Ok((

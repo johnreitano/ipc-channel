@@ -359,7 +359,7 @@ impl OsIpcOneShotServer {
     }
 
     /// Like `accept`, and also returns the connected peer's pid, as reported
-    /// by the accepted receiver's `peer_pid()`.
+    /// by the accepted receiver's `peer_pid()` (always `None` here).
     pub fn accept_with_peer_pid(
         self,
     ) -> Result<(OsIpcReceiver, IpcMessage, Option<u32>), ChannelError> {
