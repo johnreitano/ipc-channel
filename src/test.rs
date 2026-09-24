@@ -366,17 +366,10 @@ fn one_shot_server_reports_connecting_peer_pid() {
             tx.send(42).unwrap();
         })
     };
-    let (rx, received) = server.accept().unwrap();
+    let (_rx, received, peer_pid) = server.accept_with_peer_pid().unwrap();
     child_pid.wait();
     assert_eq!(received, 42);
-    assert_eq!(rx.peer_pid(), Some(child_pid as u32));
-}
-
-#[cfg(all(target_os = "macos", not(feature = "force-inprocess")))]
-#[test]
-fn channel_receiver_has_no_peer_pid() {
-    let (_tx, rx): (IpcSender<u32>, IpcReceiver<u32>) = ipc::channel().unwrap();
-    assert_eq!(rx.peer_pid(), None);
+    assert_eq!(peer_pid, Some(child_pid as u32));
 }
 
 #[cfg(not(any(

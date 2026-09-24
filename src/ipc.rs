@@ -927,6 +927,23 @@ where
             ipc_message.to()?,
         ))
     }
+
+    /// Like `accept`, and also returns the OS process id of the peer that
+    /// connected and sent the first message, when the platform can report it:
+    /// from `SO_PEERCRED` on Linux, `GetNamedPipeClientProcessId` on Windows,
+    /// and the Mach audit trailer of the accepted message on macOS. `None`
+    /// where it is unavailable.
+    pub fn accept_with_peer_pid(self) -> Result<(IpcReceiver<T>, T, Option<u32>), IpcError> {
+        let (os_receiver, ipc_message, peer_pid) = self.os_server.accept_with_peer_pid()?;
+        Ok((
+            IpcReceiver {
+                os_receiver,
+                phantom: PhantomData,
+            },
+            ipc_message.to()?,
+            peer_pid,
+        ))
+    }
 }
 
 /// Receiving end of a channel that does not used serialized messages.

@@ -35,10 +35,37 @@ mod mach_sys;
 /// this, we retry and spill to the heap.
 const SMALL_MESSAGE_SIZE: usize = 4096;
 
-/// `MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT)`: ask the kernel to append
-/// a `mach_msg_audit_trailer_t` to a received message. The trailer format
-/// (`MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0)`) is zero.
-const MACH_RCV_TRAILER_AUDIT_ELEMENTS: i32 = 3 << 24;
+// Receive-trailer options from <mach/message.h>; see
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/message.h
+// `MACH_RCV_TRAILER_TYPE` and `MACH_RCV_TRAILER_ELEMENTS` are function-like
+// macros there, so they are mirrored as `const fn`s.
+const MACH_MSG_TRAILER_FORMAT_0: i32 = 0;
+const MACH_RCV_TRAILER_AUDIT: i32 = 3;
+
+const fn mach_rcv_trailer_type(trailer_type: i32) -> i32 {
+    (trailer_type & 0xf) << 28
+}
+
+const fn mach_rcv_trailer_elements(elements: i32) -> i32 {
+    (elements & 0xf) << 24
+}
+
+/// Receive option asking the kernel to append a `mach_msg_audit_trailer_t`,
+/// which identifies the sending task, to a received message.
+const MACH_RCV_AUDIT_TRAILER: i32 = mach_rcv_trailer_type(MACH_MSG_TRAILER_FORMAT_0)
+    | mach_rcv_trailer_elements(MACH_RCV_TRAILER_AUDIT);
+
+/// `round_msg()` from <mach/message.h>: message sizes are rounded up to a
+/// multiple of 4 bytes, which is where the kernel places the trailer.
+fn round_msg(size: usize) -> usize {
+    (size + 3) & !3
+}
+
+#[link(name = "bsm")]
+extern "C" {
+    /// From <bsm/libbsm.h>: the process id recorded in an audit token.
+    fn audit_token_to_pid(token: mach_sys::audit_token_t) -> libc::pid_t;
+}
 
 pub fn set_bootstrap_prefix(prefix: impl Into<String>) {
     BOOTSTRAP_PREFIX
@@ -145,7 +172,6 @@ pub fn channel() -> Result<(OsIpcSender, OsIpcReceiver), MachError> {
 #[derive(Debug)]
 pub struct OsIpcReceiver {
     port: Cell<mach_port_t>,
-    peer_pid: Option<u32>,
 }
 
 impl Drop for OsIpcReceiver {
@@ -213,12 +239,13 @@ fn mach_port_extract_right(
 impl OsIpcReceiver {
     /// OS process id of the peer on the other end of this receiver's channel.
     ///
-    /// Only known for the receiver returned by `OsIpcOneShotServer::accept`: it
-    /// is the pid the kernel recorded in the audit trailer of the message that
-    /// was accepted, i.e. the process that connected and sent it. `None` for any
-    /// other receiver, since a Mach port can have many senders.
+    /// Always `None` on the Mach-port back-end. A receiver is a Mach receive
+    /// right, and any number of processes may hold send rights to it and send
+    /// messages on it, so a receiver has no single peer. The sender of one
+    /// specific message can be identified instead: see
+    /// `OsIpcOneShotServer::accept_with_peer_pid`.
     pub fn peer_pid(&self) -> Option<u32> {
-        self.peer_pid
+        None
     }
 
     fn new() -> Result<OsIpcReceiver, MachError> {
@@ -245,7 +272,6 @@ impl OsIpcReceiver {
     fn from_name(port: mach_port_t) -> OsIpcReceiver {
         OsIpcReceiver {
             port: Cell::new(port),
-            peer_pid: None,
         }
     }
 
@@ -751,7 +777,7 @@ fn select_with_sender(
                 .unwrap_or((MACH_RCV_MSG | MACH_RCV_LARGE, MACH_MSG_TIMEOUT_NONE)),
         };
         let flags = if audit_sender {
-            flags | MACH_RCV_TRAILER_AUDIT_ELEMENTS
+            flags | MACH_RCV_AUDIT_TRAILER
         } else {
             flags
         };
@@ -876,24 +902,21 @@ fn select_with_sender(
 }
 
 /// Reads the sender's pid from the audit trailer the kernel appended to a
-/// message received with `MACH_RCV_TRAILER_AUDIT_ELEMENTS`.
+/// message received with `MACH_RCV_AUDIT_TRAILER`.
 ///
 /// # Safety
 ///
 /// `message` must point to a message just received that way, in a buffer
 /// that still holds the trailer.
 unsafe fn audit_trailer_pid(message: *const Message) -> Option<u32> {
-    // The trailer follows the message body, rounded up to natural alignment.
-    let body_size = (*message).header.msgh_size as usize;
-    let trailer_offset = (body_size + 3) & !3;
+    let trailer_offset = round_msg((*message).header.msgh_size as usize);
     let trailer =
         (message as *const u8).add(trailer_offset) as *const mach_sys::mach_msg_audit_trailer_t;
     let trailer = ptr::read_unaligned(trailer);
     if (trailer.msgh_trailer_size as usize) < mem::size_of::<mach_sys::mach_msg_audit_trailer_t>() {
         return None;
     }
-    // audit_token_to_pid(): the pid is the sixth word of the audit token.
-    Some(trailer.msgh_audit.val[5])
+    u32::try_from(audit_token_to_pid(trailer.msgh_audit)).ok()
 }
 
 pub struct OsIpcOneShotServer {
@@ -924,6 +947,18 @@ impl OsIpcOneShotServer {
     }
 
     pub fn accept(self) -> Result<(OsIpcReceiver, IpcMessage), MachError> {
+        let ipc_message = self.receiver.recv()?;
+        Ok((self.receiver.consume(), ipc_message))
+    }
+
+    /// Like `accept`, and also returns the pid of the process that sent the
+    /// accepted message, from the audit trailer the kernel appends to it. The
+    /// kernel fills that in from the sending task, so the sender cannot forge
+    /// it. It identifies the sender of that message only; later messages on the
+    /// receiver may come from any holder of a send right.
+    pub fn accept_with_peer_pid(
+        self,
+    ) -> Result<(OsIpcReceiver, IpcMessage, Option<u32>), MachError> {
         let (result, sender_pid) =
             select_with_sender(self.receiver.port.get(), BlockingMode::Blocking, true)?;
         let ipc_message = match result {
@@ -932,9 +967,7 @@ impl OsIpcOneShotServer {
                 return Err(MachError::from(MACH_NOTIFY_NO_SENDERS))
             },
         };
-        let mut receiver = self.receiver.consume();
-        receiver.peer_pid = sender_pid;
-        Ok((receiver, ipc_message))
+        Ok((self.receiver.consume(), ipc_message, sender_pid))
     }
 }
 
