@@ -15,6 +15,9 @@ use self::mach_sys::{mach_port_right_t, mach_port_t, mach_task_self_, vm_inherit
 use crate::ipc::IpcMessage;
 
 use libc::{self, c_char, c_uint, c_void, size_t};
+use mach2::message::{
+    audit_token_t, mach_msg_audit_trailer_t, MACH_MSG_TRAILER_FORMAT_0, MACH_RCV_TRAILER_AUDIT,
+};
 use rand::{self, Rng};
 use std::cell::Cell;
 use std::convert::TryInto;
@@ -35,25 +38,15 @@ mod mach_sys;
 /// this, we retry and spill to the heap.
 const SMALL_MESSAGE_SIZE: usize = 4096;
 
-// Receive-trailer options from <mach/message.h>; see
-// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/mach/message.h
-// `MACH_RCV_TRAILER_TYPE` and `MACH_RCV_TRAILER_ELEMENTS` are function-like
-// macros there, so they are mirrored as `const fn`s.
-const MACH_MSG_TRAILER_FORMAT_0: i32 = 0;
-const MACH_RCV_TRAILER_AUDIT: i32 = 3;
-
-const fn mach_rcv_trailer_type(trailer_type: i32) -> i32 {
-    (trailer_type & 0xf) << 28
-}
-
-const fn mach_rcv_trailer_elements(elements: i32) -> i32 {
-    (elements & 0xf) << 24
-}
-
 /// Receive option asking the kernel to append a `mach_msg_audit_trailer_t`,
-/// which identifies the sending task, to a received message.
-const AUDIT_TRAILER_RCV_OPTION: i32 = mach_rcv_trailer_type(MACH_MSG_TRAILER_FORMAT_0)
-    | mach_rcv_trailer_elements(MACH_RCV_TRAILER_AUDIT);
+/// which identifies the sending task, to a received message. This is
+/// `MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+/// MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT)` from <mach/message.h>,
+/// whose two function-like macros shift the trailer type into bits 28-31 and
+/// the requested elements into bits 24-27; see
+/// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/mach/message.h
+const AUDIT_TRAILER_RCV_OPTION: i32 =
+    (((MACH_MSG_TRAILER_FORMAT_0 & 0xf) << 28) | ((MACH_RCV_TRAILER_AUDIT & 0xf) << 24)) as i32;
 
 /// `round_msg()` from <mach/message.h>: the kernel places the receive trailer
 /// at the message size rounded up to a multiple of `sizeof(natural_t)` (4
@@ -65,7 +58,7 @@ fn round_msg(size: usize) -> usize {
 #[link(name = "bsm")]
 extern "C" {
     /// From <bsm/libbsm.h>: the process id recorded in an audit token.
-    fn audit_token_to_pid(token: mach_sys::audit_token_t) -> libc::pid_t;
+    fn audit_token_to_pid(token: audit_token_t) -> libc::pid_t;
 }
 
 pub fn set_bootstrap_prefix(prefix: impl Into<String>) {
@@ -766,6 +759,7 @@ fn select_with_sender(
     debug_assert!(port != MACH_PORT_NULL);
     unsafe {
         let mut buffer = [0; SMALL_MESSAGE_SIZE];
+        let mut buffer_len = SMALL_MESSAGE_SIZE;
         let mut allocated_buffer = None;
         setup_receive_buffer(&mut buffer, port);
         let mut message = &mut buffer[0] as *mut _ as *mut Message;
@@ -799,6 +793,7 @@ fn select_with_sender(
                 let mut actual_size = (*message).header.msgh_size + max_trailer_size;
                 loop {
                     allocated_buffer = Some(libc::malloc(actual_size as size_t));
+                    buffer_len = actual_size as usize;
                     setup_receive_buffer(
                         slice::from_raw_parts_mut(
                             allocated_buffer.unwrap() as *mut u8,
@@ -840,7 +835,18 @@ fn select_with_sender(
         }
 
         let sender_pid = if audit_sender {
-            audit_trailer_pid(message)
+            let trailer_offset = round_msg((*message).header.msgh_size as usize);
+            if trailer_offset + mem::size_of::<mach_msg_audit_trailer_t>() <= buffer_len {
+                // SAFETY: the receive succeeded with the audit trailer
+                // requested, so the kernel wrote a trailer at `trailer_offset`,
+                // which is inside the buffer as checked above.
+                let trailer =
+                    ptr::read_unaligned((message as *const u8).add(trailer_offset)
+                        as *const mach_msg_audit_trailer_t);
+                audit_trailer_pid(&trailer)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -901,23 +907,15 @@ fn select_with_sender(
     }
 }
 
-/// Reads the sender's pid from the audit trailer the kernel appended to a
-/// message received with `AUDIT_TRAILER_RCV_OPTION`. Returns `None` if the
-/// kernel supplied a shorter trailer or the pid does not fit a `u32`.
-///
-/// # Safety
-///
-/// `message` must point to a message just received that way, in a buffer
-/// that still holds the trailer.
-unsafe fn audit_trailer_pid(message: *const Message) -> Option<u32> {
-    let trailer_offset = round_msg((*message).header.msgh_size as usize);
-    let trailer =
-        (message as *const u8).add(trailer_offset) as *const mach_sys::mach_msg_audit_trailer_t;
-    let trailer = ptr::read_unaligned(trailer);
-    if (trailer.msgh_trailer_size as usize) < mem::size_of::<mach_sys::mach_msg_audit_trailer_t>() {
+/// The sender's pid from an audit trailer the kernel appended to a received
+/// message. Returns `None` if the kernel supplied a shorter trailer or the pid
+/// does not fit a `u32`.
+fn audit_trailer_pid(trailer: &mach_msg_audit_trailer_t) -> Option<u32> {
+    if (trailer.msgh_trailer_size as usize) < mem::size_of::<mach_msg_audit_trailer_t>() {
         return None;
     }
-    u32::try_from(audit_token_to_pid(trailer.msgh_audit)).ok()
+    // SAFETY: a plain libbsm call that takes the token by value.
+    u32::try_from(unsafe { audit_token_to_pid(trailer.msgh_audit) }).ok()
 }
 
 pub struct OsIpcOneShotServer {

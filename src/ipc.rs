@@ -230,10 +230,11 @@ where
     /// receiver's channel, when the platform can attest it: `SO_PEERCRED` on
     /// Linux and `GetNamedPipeClientProcessId` on Windows.
     ///
-    /// Always `None` on macOS, where a receiver is a Mach receive right that
-    /// may have any number of senders, and on other targets that cannot resolve
-    /// a peer pid for the underlying transport. To authenticate the connecting
-    /// peer of an [IpcOneShotServer] on every platform, use
+    /// On macOS this always returns `None`: a Mach receiver can get messages
+    /// from any number of senders, so there is no single peer to report. It
+    /// also returns `None` where peer pids are not implemented (see
+    /// [IpcOneShotServer::accept_with_peer_pid]). To authenticate the
+    /// connecting peer of an [IpcOneShotServer] on every platform, use
     /// [IpcOneShotServer::accept_with_peer_pid] instead.
     pub fn peer_pid(&self) -> Option<u32> {
         self.os_receiver.peer_pid()
@@ -933,8 +934,12 @@ where
     /// platform can attest it: the process that opened the connection on Linux
     /// (`SO_PEERCRED`) and Windows (`GetNamedPipeClientProcessId`), and the
     /// process that sent the accepted message on macOS (Mach audit trailer).
-    /// `None` on other targets (including Android, the BSDs and illumos), with
-    /// the `force-inprocess` feature, or when the id cannot be obtained.
+    ///
+    /// `None` with the in-process back-end (used on Android and iOS, and with
+    /// the `force-inprocess` feature), where there is no separate peer process.
+    /// Also `None` on the BSDs and illumos: they have equivalent APIs
+    /// (`LOCAL_PEERCRED`, `getpeerucred`), but this is not implemented there.
+    /// And `None` if the id cannot be obtained.
     pub fn accept_with_peer_pid(self) -> Result<(IpcReceiver<T>, T, Option<u32>), IpcError> {
         let (os_receiver, ipc_message, peer_pid) = self.os_server.accept_with_peer_pid()?;
         Ok((
