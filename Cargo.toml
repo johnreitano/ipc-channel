@@ -56,6 +56,7 @@ tempfile = "3.4"
 nix = { version = "0.30", features = ["socket"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
 rand = "0.8.5"
 
 [dev-dependencies]
