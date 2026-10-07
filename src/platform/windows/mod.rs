@@ -1366,8 +1366,9 @@ impl OsIpcSender {
     /// OS process id of the process that created the server end of this
     /// sender's named pipe, read with `GetNamedPipeServerProcessId`, which the
     /// kernel resolves and the peer cannot forge. For a sender returned by
-    /// `connect` that is the process that created the one-shot server. Returns
-    /// `None` when the id cannot be obtained.
+    /// `connect` that is the process that created the one-shot server, unless
+    /// no pipe of that name existed and `connect` created it, in which case it
+    /// is the current process. Returns `None` when the id cannot be obtained.
     pub fn peer_pid(&self) -> Option<u32> {
         self.get_pipe_server_process_id()
             .ok()

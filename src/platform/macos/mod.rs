@@ -928,14 +928,16 @@ fn select_with_sender(
 }
 
 /// The sender's pid from an audit trailer the kernel appended to a received
-/// message. Returns `None` if the kernel supplied a shorter trailer or the pid
-/// does not fit a `u32`.
+/// message. Returns `None` if the kernel supplied a shorter trailer, the pid
+/// is 0 (a kernel-originated message) or it does not fit a `u32`.
 fn audit_trailer_pid(trailer: &mach_msg_audit_trailer_t) -> Option<u32> {
     if (trailer.msgh_trailer_size as usize) < mem::size_of::<mach_msg_audit_trailer_t>() {
         return None;
     }
     // SAFETY: a plain libbsm call that takes the token by value.
-    u32::try_from(unsafe { audit_token_to_pid(trailer.msgh_audit) }).ok()
+    u32::try_from(unsafe { audit_token_to_pid(trailer.msgh_audit) })
+        .ok()
+        .filter(|&pid| pid != 0)
 }
 
 pub struct OsIpcOneShotServer {

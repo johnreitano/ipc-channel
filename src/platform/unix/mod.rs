@@ -155,12 +155,13 @@ impl OsIpcReceiver {
     /// On Linux this reads `SO_PEERCRED` on the connected socket, which the
     /// kernel fills with the credentials of the peer at connect time and cannot
     /// be forged by the peer. Returns `None` when the credentials cannot be
-    /// obtained or on unix targets without `SO_PEERCRED`.
+    /// obtained or on unix targets other than Linux.
     pub fn peer_pid(&self) -> Option<u32> {
-        // The fd is only closed by `Drop` or handed off by `consume_fd`, neither
-        // of which can run while `&self` is borrowed here (`OsIpcReceiver` is
-        // not `Sync`), so it stays open for the duration of the call.
-        socket_peer_pid(self.fd.get())
+        // SAFETY: the fd is only closed by `Drop` or handed off by
+        // `consume_fd`, neither of which can run while `&self` is borrowed here
+        // (`OsIpcReceiver` is not `Sync`), so it stays open for the duration of
+        // the call.
+        unsafe { socket_peer_pid(self.fd.get()) }
     }
 
     /// Like `recv`. The unix back-end does not attest the sender of a message,
@@ -216,17 +217,20 @@ pub struct OsIpcSender {
 /// kernel fills in and the peer cannot forge. For a socket returned by
 /// `connect` that is the process that called `listen` on the server socket;
 /// for a `socketpair` end it is the process that created the pair. `None` when
-/// the credentials cannot be obtained. The caller must own `fd` and keep it
-/// open for the duration of the call.
+/// the credentials cannot be obtained.
+///
+/// # Safety
+///
+/// `fd` must be -1 or a socket that stays open for the duration of the call.
 #[cfg(target_os = "linux")]
-fn socket_peer_pid(fd: c_int) -> Option<u32> {
+unsafe fn socket_peer_pid(fd: c_int) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     use std::os::fd::BorrowedFd;
 
     if fd < 0 {
         return None;
     }
-    // SAFETY: the caller owns `fd` and keeps it open for the duration of this
+    // SAFETY: the caller guarantees `fd` stays open for the duration of this
     // call, so it is valid for the lifetime of the `BorrowedFd`.
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     let pid = getsockopt(&fd, PeerCredentials).ok()?.pid();
@@ -234,7 +238,7 @@ fn socket_peer_pid(fd: c_int) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn socket_peer_pid(_fd: c_int) -> Option<u32> {
+unsafe fn socket_peer_pid(_fd: c_int) -> Option<u32> {
     None
 }
 
@@ -249,9 +253,9 @@ impl OsIpcSender {
     /// `socket_peer_pid`. For a sender returned by `connect` that is the
     /// process that created the one-shot server.
     pub fn peer_pid(&self) -> Option<u32> {
-        // The `Arc<SharedFileDescriptor>` held by `self` keeps the fd open for
-        // the duration of the call.
-        socket_peer_pid(self.fd.0)
+        // SAFETY: the `Arc<SharedFileDescriptor>` held by `self` keeps the fd
+        // open for the duration of the call.
+        unsafe { socket_peer_pid(self.fd.0) }
     }
 
     /// Maximum size of the kernel buffer used for transfers over this channel.
