@@ -9,6 +9,7 @@
 
 use self::mach_sys::mach_port_deallocate;
 use self::mach_sys::{kern_return_t, mach_msg_body_t, mach_msg_header_t, mach_msg_return_t};
+use self::mach_sys::{mach_msg_guarded_port_descriptor_t, mach_msg_type_descriptor_t};
 use self::mach_sys::{mach_msg_ool_descriptor_t, mach_msg_port_descriptor_t, mach_msg_type_name_t};
 use self::mach_sys::{mach_msg_timeout_t, mach_port_limits_t, mach_port_msgcount_t};
 use self::mach_sys::{mach_port_right_t, mach_port_t, mach_task_self_, vm_inherit_t};
@@ -16,7 +17,9 @@ use crate::ipc::IpcMessage;
 
 use libc::{self, c_char, c_uint, c_void, size_t};
 use mach2::message::{
-    audit_token_t, mach_msg_audit_trailer_t, MACH_MSG_TRAILER_FORMAT_0, MACH_RCV_TRAILER_AUDIT,
+    audit_token_t, mach_msg_audit_trailer_t, MACH_MSG_GUARDED_PORT_DESCRIPTOR,
+    MACH_MSG_OOL_PORTS_DESCRIPTOR, MACH_MSG_OOL_VOLATILE_DESCRIPTOR, MACH_MSG_TRAILER_FORMAT_0,
+    MACH_RCV_TRAILER_AUDIT,
 };
 use rand::{self, Rng};
 use std::cell::Cell;
@@ -25,7 +28,7 @@ use std::ffi::CString;
 use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::mem;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::ptr;
 use std::slice;
 use std::sync::{OnceLock, RwLock};
@@ -33,6 +36,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod mach_sys;
+
+#[cfg(test)]
+mod tests;
 
 /// The size that we preallocate on the stack to receive messages. If the message is larger than
 /// this, we retry and spill to the heap.
@@ -851,46 +857,35 @@ fn select_with_sender(
             None
         };
 
-        let (mut ports, mut shared_memory_regions) = (Vec::new(), Vec::new());
-        let mut port_descriptor = message.offset(1) as *mut mach_msg_port_descriptor_t;
-        let mut descriptors_remaining = (*message).body.msgh_descriptor_count;
-        while descriptors_remaining > 0 {
-            if (*port_descriptor).type_() != MACH_MSG_PORT_DESCRIPTOR {
-                break;
+        // SAFETY: the kernel wrote `msgh_size` bytes of message into the
+        // buffer, which is `buffer_len` bytes long.
+        let message_size = ((*message).header.msgh_size as usize).min(buffer_len);
+        let message_bytes = slice::from_raw_parts(message as *const u8, message_size);
+        let Some(parsed) = parse_message(message_bytes) else {
+            // SAFETY: the buffer holds the message just received, which is not
+            // used after this.
+            destroy_message(slice::from_raw_parts_mut(message as *mut u8, message_size));
+            if let Some(allocated_buffer) = allocated_buffer {
+                libc::free(allocated_buffer)
             }
-            ports.push(OsOpaqueIpcChannel::from_name((*port_descriptor).name));
-            port_descriptor = port_descriptor.offset(1);
-            descriptors_remaining -= 1;
-        }
+            return Err(MachError::RcvMalformedMessage);
+        };
 
-        let mut shared_memory_descriptor = port_descriptor as *mut mach_msg_ool_descriptor_t;
-        while descriptors_remaining > 0 {
-            debug_assert!((*shared_memory_descriptor).type_() == MACH_MSG_OOL_DESCRIPTOR);
-            shared_memory_regions.push(OsIpcSharedMemory::from_raw_parts(
-                (*shared_memory_descriptor).address as *mut u8,
-                (*shared_memory_descriptor).size as usize,
-            ));
-            shared_memory_descriptor = shared_memory_descriptor.offset(1);
-            descriptors_remaining -= 1;
-        }
-
-        let has_inline_data_ptr = shared_memory_descriptor as *mut bool;
-        let has_inline_data = *has_inline_data_ptr;
-        let payload = if has_inline_data {
-            let padding_start = has_inline_data_ptr.offset(1) as *mut u8;
-            let padding_count = Message::payload_padding(padding_start as usize);
-            let payload_size_ptr = padding_start.add(padding_count) as *mut usize;
-            let payload_size = *payload_size_ptr;
-            let max_payload_size = message as usize + ((*message).header.msgh_size as usize)
-                - (shared_memory_descriptor as usize);
-            assert!(payload_size <= max_payload_size);
-            let payload_ptr = payload_size_ptr.offset(1) as *mut u8;
-            slice::from_raw_parts(payload_ptr, payload_size).to_vec()
-        } else {
-            let ool_payload = shared_memory_regions
-                .pop()
-                .expect("Missing OOL shared memory region");
-            ool_payload.to_vec()
+        let ports = parsed
+            .port_names
+            .into_iter()
+            .map(OsOpaqueIpcChannel::from_name)
+            .collect();
+        let shared_memory_regions = parsed
+            .shared_memory_regions
+            .into_iter()
+            .map(|(address, size)| OsIpcSharedMemory::from_raw_parts(address, size))
+            .collect();
+        let payload = match parsed.payload {
+            ReceivedPayload::Inline(range) => message_bytes[range].to_vec(),
+            ReceivedPayload::OutOfLine(address, size) => {
+                OsIpcSharedMemory::from_raw_parts(address, size).to_vec()
+            },
         };
 
         if let Some(allocated_buffer) = allocated_buffer {
@@ -905,6 +900,173 @@ fn select_with_sender(
             sender_pid,
         ))
     }
+}
+
+/// The contents of a received message, as found by `parse_message`. The port
+/// names and regions are not owned until they are wrapped.
+struct ParsedMessage {
+    port_names: Vec<mach_port_t>,
+    /// The address and size of each out-of-line region, without the payload's.
+    shared_memory_regions: Vec<(*mut u8, usize)>,
+    payload: ReceivedPayload,
+}
+
+enum ReceivedPayload {
+    /// The payload's byte range within the message.
+    Inline(Range<usize>),
+    /// The address and size of the out-of-line region holding the payload.
+    OutOfLine(*mut u8, usize),
+}
+
+/// Finds the ports, shared memory regions and payload in a received message,
+/// given the `msgh_size` bytes the kernel wrote, or returns `None` unless the
+/// message has the layout `OsIpcSender::send` produces. Any task holding a send
+/// right can send any bytes, so every count, offset and size is checked. Only
+/// the descriptors of a complex message are written by the kernel; in a
+/// simple message they would be the sender's own bytes, so a simple message
+/// must claim none.
+fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
+    // SAFETY: the header and body are integers, valid for any bit pattern.
+    let header: Message = unsafe { read_at(message, 0) }?;
+    let descriptor_count = if header.header.msgh_bits & MACH_MSGH_BITS_COMPLEX != 0 {
+        header.body.msgh_descriptor_count
+    } else if header.body.msgh_descriptor_count == 0 {
+        0
+    } else {
+        return None;
+    };
+
+    let mut offset = mem::size_of::<Message>();
+    let (mut port_names, mut shared_memory_regions) = (Vec::new(), Vec::new());
+    for _ in 0..descriptor_count {
+        // SAFETY: every descriptor type starts with the layout of
+        // `mach_msg_type_descriptor_t`, which is made of integers.
+        let descriptor: mach_msg_type_descriptor_t = unsafe { read_at(message, offset) }?;
+        match descriptor.type_() {
+            MACH_MSG_PORT_DESCRIPTOR if shared_memory_regions.is_empty() => {
+                // SAFETY: the descriptor is made of integers.
+                let port: mach_msg_port_descriptor_t = unsafe { read_at(message, offset) }?;
+                port_names.push(port.name);
+                offset += mem::size_of::<mach_msg_port_descriptor_t>();
+            },
+            MACH_MSG_OOL_DESCRIPTOR => {
+                // SAFETY: the descriptor is made of integers and a raw pointer.
+                let region: mach_msg_ool_descriptor_t = unsafe { read_at(message, offset) }?;
+                shared_memory_regions.push((region.address as *mut u8, region.size as usize));
+                offset += mem::size_of::<mach_msg_ool_descriptor_t>();
+            },
+            _ => return None,
+        }
+    }
+
+    // SAFETY: any byte is a valid `u8`.
+    let has_inline_data: u8 = unsafe { read_at(message, offset) }?;
+    offset += 1;
+    let payload = match has_inline_data {
+        0 => {
+            let (address, size) = shared_memory_regions.pop()?;
+            ReceivedPayload::OutOfLine(address, size)
+        },
+        1 => {
+            offset += Message::payload_padding(offset);
+            // SAFETY: any bit pattern is a valid `usize`.
+            let payload_size: usize = unsafe { read_at(message, offset) }?;
+            let payload_start = offset + mem::size_of::<usize>();
+            let payload_end = payload_start.checked_add(payload_size)?;
+            if payload_end > message.len() {
+                return None;
+            }
+            ReceivedPayload::Inline(payload_start..payload_end)
+        },
+        _ => return None,
+    };
+
+    Some(ParsedMessage {
+        port_names,
+        shared_memory_regions,
+        payload,
+    })
+}
+
+/// Releases the port rights and out-of-line memory that the kernel moved into
+/// this task with a received message.
+///
+/// # Safety
+///
+/// `message` must be the `msgh_size` bytes of a message received by this task,
+/// and nothing may use its rights or memory afterwards.
+unsafe fn destroy_message(message: &mut [u8]) {
+    mark_regions_for_deallocation(message);
+    // SAFETY: `message` is a received message, as the caller guarantees.
+    unsafe { mach2::message::mach_msg_destroy(message.as_mut_ptr() as *mut _) };
+}
+
+/// Sets the `deallocate` bit of every out-of-line region in a received complex
+/// message and retypes volatile regions as plain ones. `mach_msg_destroy` frees
+/// only regions with that bit set, which the kernel leaves clear on some, and
+/// never frees volatile ones.
+fn mark_regions_for_deallocation(message: &mut [u8]) {
+    // SAFETY: the header and body are integers, valid for any bit pattern.
+    let Some(header) = (unsafe { read_at::<Message>(message, 0) }) else {
+        return;
+    };
+    if header.header.msgh_bits & MACH_MSGH_BITS_COMPLEX == 0 {
+        return;
+    }
+    let mut offset = mem::size_of::<Message>();
+    for _ in 0..header.body.msgh_descriptor_count {
+        // SAFETY: every descriptor type starts with the layout of
+        // `mach_msg_type_descriptor_t`, which is made of integers.
+        let Some(descriptor) = (unsafe { read_at::<mach_msg_type_descriptor_t>(message, offset) })
+        else {
+            return;
+        };
+        offset += match descriptor.type_() {
+            MACH_MSG_PORT_DESCRIPTOR => mem::size_of::<mach_msg_port_descriptor_t>(),
+            MACH_MSG_GUARDED_PORT_DESCRIPTOR => {
+                mem::size_of::<mach_msg_guarded_port_descriptor_t>()
+            },
+            MACH_MSG_OOL_DESCRIPTOR
+            | MACH_MSG_OOL_VOLATILE_DESCRIPTOR
+            | MACH_MSG_OOL_PORTS_DESCRIPTOR => {
+                // SAFETY: the descriptor is made of integers and a raw pointer.
+                // An out-of-line ports descriptor has the same layout, with its
+                // `deallocate` bits in the same place.
+                let Some(mut region) =
+                    (unsafe { read_at::<mach_msg_ool_descriptor_t>(message, offset) })
+                else {
+                    return;
+                };
+                region.set_deallocate(1);
+                if descriptor.type_() == MACH_MSG_OOL_VOLATILE_DESCRIPTOR {
+                    region.set_type(MACH_MSG_OOL_DESCRIPTOR);
+                }
+                // SAFETY: `read_at` found the descriptor within `message`.
+                unsafe {
+                    ptr::write_unaligned(
+                        message.as_mut_ptr().add(offset) as *mut mach_msg_ool_descriptor_t,
+                        region,
+                    )
+                };
+                mem::size_of::<mach_msg_ool_descriptor_t>()
+            },
+            _ => return,
+        };
+    }
+}
+
+/// Reads a `T` at `offset` in `bytes`, or returns `None` if it does not fit.
+///
+/// # Safety
+///
+/// Every bit pattern must be a valid `T`.
+unsafe fn read_at<T>(bytes: &[u8], offset: usize) -> Option<T> {
+    let end = offset.checked_add(mem::size_of::<T>())?;
+    if end > bytes.len() {
+        return None;
+    }
+    // SAFETY: `offset..end` is within `bytes`.
+    Some(unsafe { ptr::read_unaligned(bytes.as_ptr().add(offset) as *const T) })
 }
 
 /// The sender's pid from an audit trailer the kernel appended to a received
@@ -1036,6 +1198,10 @@ impl Deref for OsIpcSharedMemory {
         if self.ptr.is_null() && self.length > 0 {
             panic!("attempted to access a consumed `OsIpcSharedMemory`")
         }
+        // The kernel delivers an empty out-of-line region at a null address.
+        if self.ptr.is_null() {
+            return &[];
+        }
         unsafe { slice::from_raw_parts(self.ptr, self.length) }
     }
 }
@@ -1050,6 +1216,9 @@ impl OsIpcSharedMemory {
     pub unsafe fn deref_mut(&mut self) -> &mut [u8] {
         if self.ptr.is_null() && self.length > 0 {
             panic!("attempted to access a consumed `OsIpcSharedMemory`")
+        }
+        if self.ptr.is_null() {
+            return &mut [];
         }
         unsafe { slice::from_raw_parts_mut(self.ptr, self.length) }
     }
@@ -1208,6 +1377,8 @@ pub enum MachError {
     RcvScatterSmall,
     RcvInvalidTrailer,
     RcvInProgressTimed,
+    /// A received message did not have the layout `OsIpcSender::send` uses.
+    RcvMalformedMessage,
     NotifyNoSenders,
     SendInterrupted,
     SendInvalidData,
@@ -1311,6 +1482,7 @@ impl fmt::Display for MachError {
                 fmt,
                 "Waiting for receive with timeout. (Internal use only.)"
             ),
+            MachError::RcvMalformedMessage => write!(fmt, "Received a malformed message."),
             MachError::NotifyNoSenders => write!(fmt, "No senders exist for this port."),
             MachError::Unknown(mach_error_number) => {
                 write!(fmt, "Unknown Mach error: {:x}", mach_error_number)
@@ -1438,6 +1610,7 @@ impl From<MachError> for io::Error {
             MachError::RcvScatterSmall => io::ErrorKind::InvalidInput,
             MachError::RcvInvalidTrailer => io::ErrorKind::InvalidInput,
             MachError::RcvInProgressTimed => io::ErrorKind::Interrupted,
+            MachError::RcvMalformedMessage => io::ErrorKind::InvalidData,
             MachError::NotifyNoSenders => io::ErrorKind::ConnectionReset,
             MachError::Unknown(_) => io::ErrorKind::Other,
         };
