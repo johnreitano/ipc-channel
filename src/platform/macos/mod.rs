@@ -857,8 +857,8 @@ fn select_with_sender(
             None
         };
 
-        // SAFETY: the kernel wrote `msgh_size` bytes of message into the
-        // buffer, which is `buffer_len` bytes long.
+        // SAFETY: a successful receive wrote the `msgh_size`-byte message into
+        // the `buffer_len`-byte buffer; `min` is defensive.
         let message_size = ((*message).header.msgh_size as usize).min(buffer_len);
         let message_bytes = slice::from_raw_parts(message as *const u8, message_size);
         let Some(parsed) = parse_message(message_bytes) else {
@@ -902,8 +902,9 @@ fn select_with_sender(
     }
 }
 
-/// The contents of a received message, as found by `parse_message`. The port
-/// names and regions are not owned until they are wrapped.
+/// The contents of a received message, as found by `parse_message`. Its port
+/// names and out-of-line regions, the payload's included, leak unless they are
+/// wrapped in `OsOpaqueIpcChannel` and `OsIpcSharedMemory`.
 struct ParsedMessage {
     port_names: Vec<mach_port_t>,
     /// The address and size of each out-of-line region, without the payload's.
@@ -918,27 +919,14 @@ enum ReceivedPayload {
     OutOfLine(*mut u8, usize),
 }
 
-/// Finds the ports, shared memory regions and payload in a received message,
-/// given the `msgh_size` bytes the kernel wrote, or returns `None` unless the
-/// message has the layout `OsIpcSender::send` produces. Any task holding a send
-/// right can send any bytes, so every count, offset and size is checked. Only
-/// the descriptors of a complex message are written by the kernel; in a
-/// simple message they would be the sender's own bytes, so a simple message
-/// must claim none.
+/// Finds the ports, shared memory regions and payload in the `msgh_size` bytes
+/// of a received message, or returns `None` if they cannot be read in the
+/// layout `OsIpcSender::send` writes. Any task holding a send right can send
+/// any bytes, so every read is bounds-checked.
 fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
-    // SAFETY: the header and body are integers, valid for any bit pattern.
-    let header: Message = unsafe { read_at(message, 0) }?;
-    let descriptor_count = if header.header.msgh_bits & MACH_MSGH_BITS_COMPLEX != 0 {
-        header.body.msgh_descriptor_count
-    } else if header.body.msgh_descriptor_count == 0 {
-        0
-    } else {
-        return None;
-    };
-
     let mut offset = mem::size_of::<Message>();
     let (mut port_names, mut shared_memory_regions) = (Vec::new(), Vec::new());
-    for _ in 0..descriptor_count {
+    for _ in 0..descriptor_count(message)? {
         // SAFETY: every descriptor type starts with the layout of
         // `mach_msg_type_descriptor_t`, which is made of integers.
         let descriptor: mach_msg_type_descriptor_t = unsafe { read_at(message, offset) }?;
@@ -959,8 +947,7 @@ fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
         }
     }
 
-    // SAFETY: any byte is a valid `u8`.
-    let has_inline_data: u8 = unsafe { read_at(message, offset) }?;
+    let has_inline_data = *message.get(offset)?;
     offset += 1;
     let payload = match has_inline_data {
         0 => {
@@ -968,6 +955,8 @@ fn parse_message(message: &[u8]) -> Option<ParsedMessage> {
             ReceivedPayload::OutOfLine(address, size)
         },
         1 => {
+            // `send` pads by address, which gives the same padding as this
+            // offset because `malloc` memory is 8-byte aligned.
             offset += Message::payload_padding(offset);
             // SAFETY: any bit pattern is a valid `usize`.
             let payload_size: usize = unsafe { read_at(message, offset) }?;
@@ -1002,25 +991,16 @@ unsafe fn destroy_message(message: &mut [u8]) {
 }
 
 /// Sets the `deallocate` bit of every out-of-line region in a received complex
-/// message and retypes volatile regions as plain ones. `mach_msg_destroy` frees
-/// only regions with that bit set, which the kernel leaves clear on some, and
-/// never frees volatile ones.
-fn mark_regions_for_deallocation(message: &mut [u8]) {
-    // SAFETY: the header and body are integers, valid for any bit pattern.
-    let Some(header) = (unsafe { read_at::<Message>(message, 0) }) else {
-        return;
-    };
-    if header.header.msgh_bits & MACH_MSGH_BITS_COMPLEX == 0 {
-        return;
-    }
+/// message, port arrays included, and retypes volatile regions as plain ones:
+/// `mach_msg_destroy` frees neither volatile regions nor regions without the
+/// bit, which the kernel leaves clear on physical copies. Returns `None` if it
+/// could not walk every descriptor.
+fn mark_regions_for_deallocation(message: &mut [u8]) -> Option<()> {
     let mut offset = mem::size_of::<Message>();
-    for _ in 0..header.body.msgh_descriptor_count {
+    for _ in 0..descriptor_count(message)? {
         // SAFETY: every descriptor type starts with the layout of
         // `mach_msg_type_descriptor_t`, which is made of integers.
-        let Some(descriptor) = (unsafe { read_at::<mach_msg_type_descriptor_t>(message, offset) })
-        else {
-            return;
-        };
+        let descriptor: mach_msg_type_descriptor_t = unsafe { read_at(message, offset) }?;
         offset += match descriptor.type_() {
             MACH_MSG_PORT_DESCRIPTOR => mem::size_of::<mach_msg_port_descriptor_t>(),
             MACH_MSG_GUARDED_PORT_DESCRIPTOR => {
@@ -1031,12 +1011,8 @@ fn mark_regions_for_deallocation(message: &mut [u8]) {
             | MACH_MSG_OOL_PORTS_DESCRIPTOR => {
                 // SAFETY: the descriptor is made of integers and a raw pointer.
                 // An out-of-line ports descriptor has the same layout, with its
-                // `deallocate` bits in the same place.
-                let Some(mut region) =
-                    (unsafe { read_at::<mach_msg_ool_descriptor_t>(message, offset) })
-                else {
-                    return;
-                };
+                // `deallocate` bit in the same place.
+                let mut region: mach_msg_ool_descriptor_t = unsafe { read_at(message, offset) }?;
                 region.set_deallocate(1);
                 if descriptor.type_() == MACH_MSG_OOL_VOLATILE_DESCRIPTOR {
                     region.set_type(MACH_MSG_OOL_DESCRIPTOR);
@@ -1050,9 +1026,25 @@ fn mark_regions_for_deallocation(message: &mut [u8]) {
                 };
                 mem::size_of::<mach_msg_ool_descriptor_t>()
             },
-            _ => return,
+            _ => return None,
         };
     }
+    Some(())
+}
+
+/// The number of descriptors in a received message, or `None` if its header
+/// and descriptor count do not fit or a simple message claims descriptors. Only the descriptors of
+/// a complex message are written by the kernel; in a simple message they would
+/// be the sender's own bytes.
+fn descriptor_count(message: &[u8]) -> Option<u32> {
+    // SAFETY: the header is made of integers.
+    let header: mach_msg_header_t = unsafe { read_at(message, 0) }?;
+    // SAFETY: the body is an integer.
+    let body: mach_msg_body_t = unsafe { read_at(message, mem::size_of::<mach_msg_header_t>()) }?;
+    if header.msgh_bits & MACH_MSGH_BITS_COMPLEX == 0 && body.msgh_descriptor_count != 0 {
+        return None;
+    }
+    Some(body.msgh_descriptor_count)
 }
 
 /// Reads a `T` at `offset` in `bytes`, or returns `None` if it does not fit.
@@ -1060,7 +1052,7 @@ fn mark_regions_for_deallocation(message: &mut [u8]) {
 /// # Safety
 ///
 /// Every bit pattern must be a valid `T`.
-unsafe fn read_at<T>(bytes: &[u8], offset: usize) -> Option<T> {
+unsafe fn read_at<T: Copy>(bytes: &[u8], offset: usize) -> Option<T> {
     let end = offset.checked_add(mem::size_of::<T>())?;
     if end > bytes.len() {
         return None;
@@ -1198,7 +1190,8 @@ impl Deref for OsIpcSharedMemory {
         if self.ptr.is_null() && self.length > 0 {
             panic!("attempted to access a consumed `OsIpcSharedMemory`")
         }
-        // The kernel delivers an empty out-of-line region at a null address.
+        // An empty region, received or allocated, is at address 0, which
+        // `slice::from_raw_parts` does not accept.
         if self.ptr.is_null() {
             return &[];
         }
@@ -1377,7 +1370,8 @@ pub enum MachError {
     RcvScatterSmall,
     RcvInvalidTrailer,
     RcvInProgressTimed,
-    /// A received message did not have the layout `OsIpcSender::send` uses.
+    /// A received message could not be read in the layout `OsIpcSender::send`
+    /// writes. It was discarded, and the error does not close the receiver.
     RcvMalformedMessage,
     NotifyNoSenders,
     SendInterrupted,

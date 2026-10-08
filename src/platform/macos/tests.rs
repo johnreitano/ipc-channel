@@ -1,18 +1,23 @@
 use super::mach_sys::{
-    self, mach_msg_header_t, mach_msg_ool_descriptor_t, mach_msg_ool_ports_descriptor_t,
-    mach_msg_port_descriptor_t, mach_port_t,
+    self, mach_msg_guarded_port_descriptor_t, mach_msg_header_t, mach_msg_ool_descriptor_t,
+    mach_msg_ool_ports_descriptor_t, mach_msg_port_descriptor_t, mach_port_t,
 };
 use super::{
-    allocate_vm_pages, channel, mach_port_allocate, mach_port_mod_release, mach_task_self,
-    mark_regions_for_deallocation, parse_message, read_at, MachError, Message, OsIpcOneShotServer,
-    OsIpcSender, ReceivedPayload, KERN_SUCCESS, MACH_MSGH_BITS_COMPLEX, MACH_MSG_OOL_DESCRIPTOR,
-    MACH_MSG_PORT_DESCRIPTOR, MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_COPY_SEND,
-    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_VIRTUAL_COPY, MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE,
+    allocate_vm_pages, channel, destroy_message, mach_port_allocate, mach_port_mod_release,
+    mach_task_self, mark_regions_for_deallocation, parse_message, read_at, MachError, Message,
+    OsIpcOneShotServer, OsIpcSender, OsIpcSharedMemory, ReceivedPayload, KERN_SUCCESS,
+    MACH_MSGH_BITS_COMPLEX, MACH_MSG_OOL_DESCRIPTOR, MACH_MSG_PORT_DESCRIPTOR, MACH_MSG_SUCCESS,
+    MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND,
+    MACH_MSG_TYPE_MOVE_SEND, MACH_MSG_VIRTUAL_COPY, MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE,
     MACH_PORT_RIGHT_SEND, MACH_SEND_MSG,
 };
 use mach2::message::{
-    MACH_MSG_OOL_PORTS_DESCRIPTOR, MACH_MSG_OOL_VOLATILE_DESCRIPTOR, MACH_MSG_PHYSICAL_COPY,
+    MACH_MSG_GUARDED_PORT_DESCRIPTOR, MACH_MSG_OOL_PORTS_DESCRIPTOR,
+    MACH_MSG_OOL_VOLATILE_DESCRIPTOR, MACH_MSG_PHYSICAL_COPY,
 };
+use mach2::vm::mach_vm_region_recurse;
+use mach2::vm_region::{vm_region_recurse_info_t, vm_region_submap_info_64};
+use mach2::vm_statistics::{vm_make_tag, VM_FLAGS_ANYWHERE, VM_MEMORY_APPLICATION_SPECIFIC_11};
 use std::{mem, ptr, slice};
 
 const HEADER_SIZE: usize = mem::size_of::<mach_msg_header_t>();
@@ -23,10 +28,21 @@ fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { slice::from_raw_parts(value as *const T as *const u8, mem::size_of::<T>()) }
 }
 
-/// A message assembled byte by byte in the layout `OsIpcSender::send` uses,
-/// so that tests can make it malformed.
+/// `bytes`, copied into a buffer aligned for a message header.
+fn aligned(bytes: &[u8]) -> Vec<u64> {
+    let mut buffer = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: `buffer` holds at least `bytes.len()` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.as_mut_ptr() as *mut u8, bytes.len())
+    };
+    buffer
+}
+
+/// A message assembled field by field in the layout `OsIpcSender::send`
+/// writes, so that tests can make it malformed.
 struct RawMessage {
     bits: u32,
+    /// Everything after the header, starting with the descriptor count.
     body: Vec<u8>,
 }
 
@@ -40,9 +56,18 @@ impl RawMessage {
         .push(&descriptor_count)
     }
 
+    /// Appends the bytes of `value`, whose type must have no padding.
     fn push<T>(mut self, value: &T) -> RawMessage {
         self.body.extend_from_slice(as_bytes(value));
         self
+    }
+
+    fn guarded_port(self, name: mach_port_t) -> RawMessage {
+        // SAFETY: an all-zero descriptor is valid.
+        let mut descriptor: mach_msg_guarded_port_descriptor_t = unsafe { mem::zeroed() };
+        descriptor.name = name;
+        descriptor.set_type(MACH_MSG_GUARDED_PORT_DESCRIPTOR);
+        self.push(&descriptor)
     }
 
     fn port(self, name: mach_port_t, disposition: u32) -> RawMessage {
@@ -75,6 +100,8 @@ impl RawMessage {
         )
     }
 
+    /// The descriptor points at `names`, which must stay alive while the
+    /// message is in use.
     fn port_array(self, names: &[mach_port_t], disposition: u32) -> RawMessage {
         // SAFETY: an all-zero descriptor is valid.
         let mut descriptor: mach_msg_ool_ports_descriptor_t = unsafe { mem::zeroed() };
@@ -129,11 +156,9 @@ impl RawMessage {
     /// Sends the message to `port`, the name of a send right.
     fn send(&self, port: mach_port_t) {
         let bytes = self.bytes(port);
-        let mut buffer = vec![0u64; bytes.len().div_ceil(8)];
-        // SAFETY: `buffer` holds at least `bytes.len()` bytes and is aligned
-        // for the header.
+        let mut buffer = aligned(&bytes);
+        // SAFETY: `buffer` holds the message and is aligned for the header.
         let result = unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.as_mut_ptr() as *mut u8, bytes.len());
             mach_sys::mach_msg(
                 buffer.as_mut_ptr() as *mut mach_msg_header_t,
                 MACH_SEND_MSG,
@@ -158,7 +183,7 @@ fn send_refs(name: mach_port_t) -> u32 {
     refs
 }
 
-/// A page of this task's memory filled with a known byte.
+/// `SIZE` bytes of this task's memory, filled with a known byte.
 struct Page(*mut u8);
 
 impl Page {
@@ -175,7 +200,9 @@ impl Page {
     }
 
     fn is_intact(&self) -> bool {
-        // SAFETY: the page stays mapped until `drop`.
+        // SAFETY: the memory is mapped unless the code under test freed it;
+        // then this faults or reads whatever was mapped there since, and the
+        // test fails.
         unsafe { slice::from_raw_parts(self.0, Page::SIZE) }
             .iter()
             .all(|byte| *byte == Page::FILL)
@@ -188,6 +215,56 @@ impl Drop for Page {
         let result =
             unsafe { mach_sys::vm_deallocate(mach_task_self(), self.0 as usize, Page::SIZE) };
         assert_eq!(result, KERN_SUCCESS);
+    }
+}
+
+/// A tag from the application-specific range that nothing else here allocates
+/// with, so that `is_tagged_mapping` is not fooled by another mapping at a
+/// freed address.
+const TEST_VM_TAG: u32 = VM_MEMORY_APPLICATION_SPECIFIC_11;
+
+fn allocate_tagged(size: usize) -> *mut u8 {
+    let mut address = 0;
+    let flags = VM_FLAGS_ANYWHERE | vm_make_tag(TEST_VM_TAG);
+    // SAFETY: a plain kernel call with a valid out pointer.
+    let result = unsafe { mach_sys::vm_allocate(mach_task_self(), &mut address, size, flags) };
+    assert_eq!(result, KERN_SUCCESS);
+    address as *mut u8
+}
+
+/// Whether `address` is still mapped by an `allocate_tagged` allocation.
+fn is_tagged_mapping(address: *mut u8) -> bool {
+    let address = address as u64;
+    let (mut region, mut size, mut depth) = (address, 0, 0);
+    let mut info = vm_region_submap_info_64::default();
+    let mut count = vm_region_submap_info_64::count();
+    // SAFETY: a plain kernel call with valid out pointers and `info`'s size.
+    let result = unsafe {
+        mach_vm_region_recurse(
+            mach_task_self(),
+            &mut region,
+            &mut size,
+            &mut depth,
+            &mut info as *mut _ as vm_region_recurse_info_t,
+            &mut count,
+        )
+    };
+    let user_tag = info.user_tag;
+    result == KERN_SUCCESS
+        && region <= address
+        && address < region + size
+        && user_tag == TEST_VM_TAG
+}
+
+/// Asserts that the out-of-line descriptors from `offset` in a marked message
+/// have the `deallocate` bit set and the given types.
+fn assert_marked_regions(message: &[u8], offset: usize, types: &[u32]) {
+    for (index, &type_) in types.iter().enumerate() {
+        let at = offset + index * mem::size_of::<mach_msg_ool_descriptor_t>();
+        // SAFETY: the descriptor is made of integers and a raw pointer.
+        let region: mach_msg_ool_descriptor_t = unsafe { read_at(message, at) }.unwrap();
+        assert_eq!(region.deallocate(), 1);
+        assert_eq!(region.type_(), type_);
     }
 }
 
@@ -246,9 +323,84 @@ fn receiver_destroys_a_message_with_an_array_of_ports() {
 }
 
 #[test]
-fn rejected_message_has_every_region_marked_for_deallocation() {
-    let mut bytes = RawMessage::new(true, 4)
+fn receiver_rejects_an_inline_payload_that_runs_past_the_message() {
+    let (sender, receiver) = channel().unwrap();
+    // The payload would end in the trailer, which is in the receive buffer but
+    // past the message.
+    RawMessage::new(true, 0)
+        .payload(1, 10, b"hi")
+        .send(sender.port);
+
+    assert_eq!(receiver.recv().err(), Some(MachError::RcvMalformedMessage));
+}
+
+#[test]
+fn destroying_a_message_frees_every_kind_of_region() {
+    const SIZE: usize = 16384;
+    let physical = allocate_tagged(SIZE);
+    let volatile = allocate_tagged(SIZE);
+    let port_array = allocate_tagged(SIZE);
+    // SAFETY: the memory is zero-filled, so it holds null port names.
+    let names = unsafe {
+        slice::from_raw_parts(
+            port_array as *const mach_port_t,
+            SIZE / mem::size_of::<mach_port_t>(),
+        )
+    };
+    let bytes = RawMessage::new(true, 4)
+        .guarded_port(MACH_PORT_NULL)
+        .region_with(
+            physical,
+            SIZE,
+            MACH_MSG_OOL_DESCRIPTOR,
+            MACH_MSG_PHYSICAL_COPY,
+        )
+        .region_with(
+            volatile,
+            SIZE,
+            MACH_MSG_OOL_VOLATILE_DESCRIPTOR,
+            MACH_MSG_VIRTUAL_COPY,
+        )
+        .port_array(names, MACH_MSG_TYPE_MOVE_SEND)
+        .inline_payload(&[])
+        .bytes(MACH_PORT_NULL);
+    for address in [physical, volatile, port_array] {
+        assert!(is_tagged_mapping(address), "{address:?} not found");
+    }
+    // A walk that went wrong would make `destroy_message` free the wrong
+    // memory, so check the marking first.
+    let mut marked = bytes.clone();
+    assert_eq!(mark_regions_for_deallocation(&mut marked), Some(()));
+    assert_marked_regions(
+        &marked,
+        mem::size_of::<Message>() + mem::size_of::<mach_msg_guarded_port_descriptor_t>(),
+        &[
+            MACH_MSG_OOL_DESCRIPTOR,
+            MACH_MSG_OOL_DESCRIPTOR,
+            MACH_MSG_OOL_PORTS_DESCRIPTOR,
+        ],
+    );
+    let mut buffer = aligned(&bytes);
+
+    // SAFETY: like a message the kernel delivered, this one carries only null
+    // names and memory that this task owns and does not use again.
+    unsafe {
+        destroy_message(slice::from_raw_parts_mut(
+            buffer.as_mut_ptr() as *mut u8,
+            bytes.len(),
+        ))
+    };
+
+    for address in [physical, volatile, port_array] {
+        assert!(!is_tagged_mapping(address), "{address:?} still mapped");
+    }
+}
+
+#[test]
+fn every_region_is_marked_for_deallocation() {
+    let mut bytes = RawMessage::new(true, 5)
         .port(7, 0)
+        .guarded_port(8)
         .region_with(
             0x1000 as *mut u8,
             16,
@@ -266,23 +418,21 @@ fn rejected_message_has_every_region_marked_for_deallocation() {
         .bytes(MACH_PORT_NULL);
     let original = bytes.clone();
 
-    mark_regions_for_deallocation(&mut bytes);
+    let result = mark_regions_for_deallocation(&mut bytes);
 
-    let first_region = mem::size_of::<Message>() + mem::size_of::<mach_msg_port_descriptor_t>();
+    assert_eq!(result, Some(()));
+    let first_region = mem::size_of::<Message>()
+        + mem::size_of::<mach_msg_port_descriptor_t>()
+        + mem::size_of::<mach_msg_guarded_port_descriptor_t>();
     assert_eq!(bytes[..first_region], original[..first_region]);
     let expected_types = [
         MACH_MSG_OOL_DESCRIPTOR,
         MACH_MSG_OOL_DESCRIPTOR,
         MACH_MSG_OOL_PORTS_DESCRIPTOR,
     ];
-    for (index, expected_type) in expected_types.into_iter().enumerate() {
-        let offset = first_region + index * mem::size_of::<mach_msg_ool_descriptor_t>();
-        // SAFETY: the descriptor is made of integers and a raw pointer.
-        let region: mach_msg_ool_descriptor_t = unsafe { read_at(&bytes, offset) }.unwrap();
-        assert_eq!(region.deallocate(), 1);
-        assert_eq!(region.type_(), expected_type);
-    }
-    let regions_end = first_region + 3 * mem::size_of::<mach_msg_ool_descriptor_t>();
+    assert_marked_regions(&bytes, first_region, &expected_types);
+    let regions_end =
+        first_region + expected_types.len() * mem::size_of::<mach_msg_ool_descriptor_t>();
     assert_eq!(bytes[regions_end..], original[regions_end..]);
 }
 
@@ -305,6 +455,34 @@ fn receiver_accepts_an_empty_out_of_line_payload() {
         .send(sender.port);
 
     assert!(receiver.recv().unwrap().data.is_empty());
+}
+
+#[test]
+fn receiver_hands_over_an_empty_region_as_an_empty_slice() {
+    let (sender, receiver) = channel().unwrap();
+    RawMessage::new(true, 1)
+        .region(ptr::null_mut(), 0)
+        .inline_payload(b"hi")
+        .send(sender.port);
+
+    let mut message = receiver.recv().unwrap();
+    let region = &mut message.os_ipc_shared_memory_regions[0];
+
+    assert!(region.ptr.is_null());
+    assert!(region.is_empty());
+    // SAFETY: nothing else refers to the region.
+    assert!(unsafe { region.deref_mut() }.is_empty());
+}
+
+#[test]
+fn an_allocated_empty_region_is_an_empty_slice() {
+    let mut region = OsIpcSharedMemory::from_bytes(&[]);
+
+    assert!(region.ptr.is_null());
+    assert!(region.is_empty());
+    assert!(region.clone().is_empty());
+    // SAFETY: nothing else refers to the region.
+    assert!(unsafe { region.deref_mut() }.is_empty());
 }
 
 #[test]
@@ -374,9 +552,10 @@ fn parse_rejects_a_simple_message_that_claims_descriptors() {
 
 #[test]
 fn parse_rejects_more_descriptors_than_the_message_holds() {
+    // The second descriptor would run past the end of the message.
     let bytes = RawMessage::new(true, u32::MAX)
         .region(0x1000 as *mut u8, 16)
-        .inline_payload(b"hi")
+        .out_of_line_payload()
         .bytes(MACH_PORT_NULL);
 
     assert!(parse_message(&bytes).is_none());
@@ -419,9 +598,10 @@ fn parse_rejects_an_inline_data_flag_that_is_not_a_bool() {
 
 #[test]
 fn parse_rejects_an_inline_payload_longer_than_the_message() {
-    for declared_size in [4096, usize::MAX] {
+    // A declared size of 4 would end the message exactly.
+    for declared_size in [5, 4096, usize::MAX] {
         let bytes = RawMessage::new(false, 0)
-            .payload(1, declared_size, b"hi")
+            .payload(1, declared_size, b"abcd")
             .bytes(MACH_PORT_NULL);
 
         assert!(parse_message(&bytes).is_none());
