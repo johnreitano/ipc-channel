@@ -359,11 +359,17 @@ where
     /// of that name it created the pipe itself, and the pid reported is then
     /// the caller's own.
     ///
-    /// On macOS this always returns `None`: a sender is a Mach send right,
-    /// which has no attestable owner. The process that sent a particular
-    /// message can be identified on the receiving side instead, see
-    /// [IpcReceiver::recv_with_sender_pid]. Also `None` where peer pids are
-    /// not implemented.
+    /// On macOS this always returns `None`. A sender is a Mach send right,
+    /// and Mach only attests identity on messages, through the audit trailer
+    /// of a received message: it has no query for which task holds the
+    /// receive right a send right names, so there is nothing to read until
+    /// the other side sends something. The macOS equivalent of this check is
+    /// therefore to verify the first message that comes back, with
+    /// [IpcReceiver::recv_with_sender_pid] on a receiver whose sender was
+    /// passed along in the connect message, before trusting anything on that
+    /// channel. The accepting side has the same information from
+    /// [IpcOneShotServer::accept_with_peer_pid]. Also `None` where peer pids
+    /// are not implemented.
     pub fn peer_pid(&self) -> Option<u32> {
         self.os_sender.peer_pid()
     }
