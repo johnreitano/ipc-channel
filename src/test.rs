@@ -415,6 +415,21 @@ fn one_shot_server_reports_peer_pid_for_same_process_peer() {
     }
 }
 
+/// Whether `IpcSender::peer_pid()` reports the process at the other end of a
+/// connection on this back-end: the unix and Windows transports do; the Mach
+/// transport does not (a send right has no readable owner) and neither does
+/// the in-process one.
+fn connected_peer_pid_is_reported() -> bool {
+    cfg!(not(any(target_os = "macos", feature = "force-inprocess")))
+}
+
+/// Whether `IpcReceiver::recv_with_sender_pid()` reports the sender of a
+/// message on this back-end: only the Mach transport does, from the audit
+/// trailer the kernel appends to the message.
+fn message_sender_pid_is_reported() -> bool {
+    cfg!(all(target_os = "macos", not(feature = "force-inprocess")))
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[test]
 fn sender_reports_peer_pid_for_same_process_server() {
@@ -428,11 +443,8 @@ fn sender_reports_peer_pid_for_same_process_server() {
     let (_rx, received, _) = server.accept_with_peer_pid().unwrap();
     let peer_pid = client.join().unwrap();
     assert_eq!(received, 7);
-    if cfg!(any(feature = "force-inprocess", target_os = "macos")) {
-        assert_eq!(peer_pid, None);
-    } else {
-        assert_eq!(peer_pid, Some(std::process::id()));
-    }
+    let expected = connected_peer_pid_is_reported().then(std::process::id);
+    assert_eq!(peer_pid, expected);
 }
 
 #[cfg(not(any(
@@ -452,11 +464,8 @@ fn sender_reports_peer_pid_for_server_in_another_process() {
     };
     let (_rx, peer_pid_seen_by_child, _) = server.accept_with_peer_pid().unwrap();
     child_pid.wait();
-    if cfg!(target_os = "macos") {
-        assert_eq!(peer_pid_seen_by_child, None);
-    } else {
-        assert_eq!(peer_pid_seen_by_child, Some(std::process::id()));
-    }
+    let expected = connected_peer_pid_is_reported().then(std::process::id);
+    assert_eq!(peer_pid_seen_by_child, expected);
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -467,11 +476,8 @@ fn receiver_reports_sender_pid_for_same_process_sender() {
     let (received, sender_pid) = rx.recv_with_sender_pid().unwrap();
     sender.join().unwrap();
     assert_eq!(received, 3);
-    if cfg!(all(target_os = "macos", not(feature = "force-inprocess"))) {
-        assert_eq!(sender_pid, Some(std::process::id()));
-    } else {
-        assert_eq!(sender_pid, None);
-    }
+    let expected = message_sender_pid_is_reported().then(std::process::id);
+    assert_eq!(sender_pid, expected);
 }
 
 #[cfg(not(any(
@@ -501,11 +507,8 @@ fn receiver_reports_sender_pid_for_sender_in_another_process() {
     let (received, sender_pid) = parent_rx.recv_with_sender_pid().unwrap();
     child_pid.wait();
     assert_eq!(received, 99);
-    if cfg!(target_os = "macos") {
-        assert_eq!(sender_pid, Some(child_pid as u32));
-    } else {
-        assert_eq!(sender_pid, None);
-    }
+    let expected = message_sender_pid_is_reported().then(|| child_pid as u32);
+    assert_eq!(sender_pid, expected);
 }
 
 #[cfg(not(any(
